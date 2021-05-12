@@ -7,26 +7,16 @@
     # Install following library into Raspberry Pi (https://github.com/FRC4564/Maestro)
     # Alexandra said that it worked before but only for one motor, may have been a power issue so worth a try.
 
-# [NOT NEEDED] Step 3: Install PS4 Controller Library on Pi to control the raspberry pi's actions
-    # Found here: https://github.com/ArturSpirin/pyPS4Controller
-    # Can supposedly recognize all buttons and joystick movement, translate into values/bools
-    # Bobby says it was buggy, might have to try this instead: https://github.com/FRC4564/BasicPiBot
-    # Or this with XBOX CONTROLLER: https://github.com/FRC4564/BasicPiBot
-
-# [NEW] Step 3: Make code for simple text commands for movement
+# Step 3: Make code for simple text commands for movement
     # Running this script from my laptop via SSH on the Pi will be simple.
 
 
 
-# LIST OF MAESTRO MOTOR MOVEMENT SEQUENCES:
-# 0 = Sit
-# 1 = Stand / Idle
-# 2 = Walk Forward
-# 3 = Walk Backward
-# 4 = Turn Left
-# 5 = Turn Right
-# 6 = Crouch before Jumping
-# 7 = Jump
+# HOW TO RUN IN RASPBERRY PI
+# "Connect raspberry pi to power, connect Maestro to Pi, connect any accessories (i.e. a mic for voice recognition)"
+# cd env
+# source bin/activate
+# python robotDog.py -m deepspeech-0.9.3-models.tflite -s deepspeech-0.9.3-models.scorer
 
 
 
@@ -34,84 +24,424 @@
 # python-given imports
 import sys
 import time #For pausing the script
-# third party imports
-import maestro #For controlling Maestro
+from datetime import datetime
+import logging
+import maestro #from maestro.py
+import deepspeech
+import threading, collections, queue, os, os.path
+import numpy as np
+import pyaudio
+import wave
+import webrtcvad
+from halo import Halo
+from scipy import signal
+logging.basicConfig(level=20)
+
+
+
+###################################################
+
+
+
+class Audio(object):
+    """Streams raw audio from microphone. Data is received in a separate thread, and stored in a buffer, to be read from."""
+
+    FORMAT = pyaudio.paInt16
+    # Network/VAD rate-space
+    RATE_PROCESS = 16000
+    CHANNELS = 1
+    BLOCKS_PER_SECOND = 50
+
+    def __init__(self, callback=None, device=None, input_rate=RATE_PROCESS, file=None):
+        def proxy_callback(in_data, frame_count, time_info, status):
+            #pylint: disable=unused-argument
+            if self.chunk is not None:
+                in_data = self.wf.readframes(self.chunk)
+            callback(in_data)
+            return (None, pyaudio.paContinue)
+        if callback is None: callback = lambda in_data: self.buffer_queue.put(in_data)
+        self.buffer_queue = queue.Queue()
+        self.device = device
+        self.input_rate = input_rate
+        self.sample_rate = self.RATE_PROCESS
+        self.block_size = int(self.RATE_PROCESS / float(self.BLOCKS_PER_SECOND))
+        self.block_size_input = int(self.input_rate / float(self.BLOCKS_PER_SECOND))
+        self.pa = pyaudio.PyAudio()
+
+        kwargs = {
+            'format': self.FORMAT,
+            'channels': self.CHANNELS,
+            'rate': self.input_rate,
+            'input': True,
+            'frames_per_buffer': self.block_size_input,
+            'stream_callback': proxy_callback,
+        }
+
+        self.chunk = None
+        # if not default device
+        if self.device:
+            kwargs['input_device_index'] = self.device
+        elif file is not None:
+            self.chunk = 320
+            self.wf = wave.open(file, 'rb')
+
+        self.stream = self.pa.open(**kwargs)
+        self.stream.start_stream()
+
+    def resample(self, data, input_rate):
+        """
+        Microphone may not support our native processing sampling rate, so
+        resample from input_rate to RATE_PROCESS here for webrtcvad and
+        deepspeech
+
+        Args:
+            data (binary): Input audio stream
+            input_rate (int): Input audio rate to resample from
+        """
+        data16 = np.fromstring(string=data, dtype=np.int16)
+        resample_size = int(len(data16) / self.input_rate * self.RATE_PROCESS)
+        resample = signal.resample(data16, resample_size)
+        resample16 = np.array(resample, dtype=np.int16)
+        return resample16.tostring()
+
+    def read_resampled(self):
+        """Return a block of audio data resampled to 16000hz, blocking if necessary."""
+        return self.resample(data=self.buffer_queue.get(),
+                             input_rate=self.input_rate)
+
+    def read(self):
+        """Return a block of audio data, blocking if necessary."""
+        return self.buffer_queue.get()
+
+    def destroy(self):
+        self.stream.stop_stream()
+        self.stream.close()
+        self.pa.terminate()
+
+    frame_duration_ms = property(lambda self: 1000 * self.block_size // self.sample_rate)
+
+    def write_wav(self, filename, data):
+        logging.info("write wav %s", filename)
+        wf = wave.open(filename, 'wb')
+        wf.setnchannels(self.CHANNELS)
+        # wf.setsampwidth(self.pa.get_sample_size(FORMAT))
+        assert self.FORMAT == pyaudio.paInt16
+        wf.setsampwidth(2)
+        wf.setframerate(self.sample_rate)
+        wf.writeframes(data)
+        wf.close()
+
+
+
+class VADAudio(Audio):
+    """Filter & segment audio with voice activity detection."""
+
+    def __init__(self, aggressiveness=3, device=None, input_rate=None, file=None):
+        super().__init__(device=device, input_rate=input_rate, file=file)
+        self.vad = webrtcvad.Vad(aggressiveness)
+
+    def frame_generator(self):
+        """Generator that yields all audio frames from microphone."""
+        if self.input_rate == self.RATE_PROCESS:
+            while True:
+                yield self.read()
+        else:
+            while True:
+                yield self.read_resampled()
+
+    def vad_collector(self, padding_ms=300, ratio=0.75, frames=None):
+        """Generator that yields series of consecutive audio frames comprising each utterence, separated by yielding a single None.
+            Determines voice activity by ratio of frames in padding_ms. Uses a buffer to include padding_ms prior to being triggered.
+            Example: (frame, ..., frame, None, frame, ..., frame, None, ...)
+                      |---utterence---|        |---utterence---|
+        """
+        if frames is None: frames = self.frame_generator()
+        num_padding_frames = padding_ms // self.frame_duration_ms
+        ring_buffer = collections.deque(maxlen=num_padding_frames)
+        triggered = False
+
+        for frame in frames:
+            if len(frame) < 640:
+                return
+
+            is_speech = self.vad.is_speech(frame, self.sample_rate)
+
+            if not triggered:
+                ring_buffer.append((frame, is_speech))
+                num_voiced = len([f for f, speech in ring_buffer if speech])
+                if num_voiced > ratio * ring_buffer.maxlen:
+                    triggered = True
+                    for f, s in ring_buffer:
+                        yield f
+                    ring_buffer.clear()
+
+            else:
+                yield frame
+                ring_buffer.append((frame, is_speech))
+                num_unvoiced = len([f for f, speech in ring_buffer if not speech])
+                if num_unvoiced > ratio * ring_buffer.maxlen:
+                    triggered = False
+                    yield None
+                    ring_buffer.clear()
+
+
+
+###########################################
+
+
+# LIST OF MAESTRO MOTOR MOVEMENT SEQUENCES:
+# 0 = Stand / Idle
+# 1 = Walk Forward
+# 2 = Walk Backward
+# 3 = Turn Right
+# 4 = Turn Left
+# 5 = Sit / Crouch before Jumping
+# 6 = Jump
+
+
+
+def main(ARGS):
+    # Load DeepSpeech model
+    if os.path.isdir(ARGS.model):
+        model_dir = ARGS.model
+        ARGS.model = os.path.join(model_dir, 'output_graph.pb')
+        ARGS.scorer = os.path.join(model_dir, ARGS.scorer)
+    print('Initializing model...')
+    logging.info("ARGS.model: %s", ARGS.model)
+    model = deepspeech.Model(ARGS.model)
+    if ARGS.scorer:
+        logging.info("ARGS.scorer: %s", ARGS.scorer)
+        model.enableExternalScorer(ARGS.scorer)
+
+
+    # Wrapping the robot loop in a try/finally structure makes sure that the robot stops
+    # moving if your code errors out or the robot loop completes. 
+    try:
+        # Maestro control initialization
+        m = maestro.Controller() # for Aljon's PC, the value here should be the string 'COM4'
+
+        # Mode text = 0 vs Mode voice = 1
+        mode = 0
+
+        while True:
+            if (mode == 0):
+                command = input("> ").strip()
+
+                # Change mode
+                if (command == "mode 1"):
+                    print("Now in Mode 1 [voice recognition]")
+                    mode = 1
+
+                # Jump
+                elif (command == "jump"):
+                    m.runScriptSub(0) # run idle/reset sequence
+                    # while (m.getMovingState): time.sleep(0.5)
+                    
+                    print("Preparing to jump...")
+                    m.runScriptSub(5) # run crouching sequence
+                    # while (m.getMovingState): time.sleep(0.5)
+                    print("Ready to jump!")
+                    m.runScriptSub(6) # run jumping sequence
+                    # while (m.getMovingState): time.sleep(0.5)
+                    print("JUMP!!!")
+
+                # Walk Forward
+                elif (command == "walk forward"):
+                    m.runScriptSub(0) # run idle/reset sequence
+                    # while (m.getMovingState): time.sleep(0.5)
+                    
+                    print("Walking... press Ctrl+C to stop walking.")
+                    try:
+                        steps = 0
+                        while (m.getMovingState):
+                            steps += 1
+                            print(f"Steps taken = {steps}")
+                            m.runScriptSub(1) # run forwards walking sequence
+                            time.sleep(0.5)
+                    
+                    except KeyboardInterrupt:
+                        print('Done walking!')
+
+                # Walk Backward
+                elif (command == "walk backward"):
+                    m.runScriptSub(0) # run idle/reset sequence
+                    # while (m.getMovingState): time.sleep(0.5)
+                    
+                    print("Walking... press Ctrl+C to stop walking.")
+                    try:
+                        steps = 0
+                        while (m.getMovingState):
+                            steps += 1
+                            print(f"Steps taken = {steps}")
+                            m.runScriptSub(2) # run backwards walking sequence
+                            time.sleep(0.5)
+                    
+                    except KeyboardInterrupt:
+                        print('Done walking!')
+
+                # Turn right
+                elif (command == "turn right"):
+                    pass
+
+                # Turn left
+                elif (command == "turn left"):
+                    pass
+
+                # Quit
+                elif (command == "quit"):
+                    print("Shutting down Robot Dog...")
+                    m.runScriptSub(5) # run sitting sequence
+                    # while (m.getMovingState): time.sleep(0.5)
+                    break
+
+                # Invalid input
+                else:
+                    print("Try again, I didn't recognize that command.")
+            
+
+
+            elif (mode == 1):
+                try:
+                    # Start audio with VAD
+                    vad_audio = VADAudio(aggressiveness=ARGS.vad_aggressiveness,
+                                        device=ARGS.device,
+                                        input_rate=ARGS.rate,
+                                        file=ARGS.file)
+                    print("NOTE: Press Ctrl+C or say 'quit' to exit voice recognition at any time.")
+                    print("Listening...")
+                    frames = vad_audio.vad_collector()
+
+                    # Stream from microphone to DeepSpeech using VAD
+                    spinner = None
+                    if not ARGS.nospinner:
+                        spinner = Halo(spinner='line')
+                    stream_context = model.createStream()
+                    wav_data = bytearray()
+                    for frame in frames:
+                        if frame is not None:
+                            if spinner: spinner.start()
+                            logging.debug("streaming frame")
+                            stream_context.feedAudioContent(np.frombuffer(frame, np.int16))
+                            if ARGS.savewav: wav_data.extend(frame)
+                        else:
+                            if spinner: spinner.stop()
+                            logging.debug("end utterence")
+                            if ARGS.savewav:
+                                vad_audio.write_wav(os.path.join(ARGS.savewav, datetime.now().strftime("savewav_%Y-%m-%d_%H-%M-%S_%f.wav")), wav_data)
+                                wav_data = bytearray()
+
+                            # Record words that were said
+                            command = stream_context.finishStream()
+                            print("Recognized: %s" % command)
+
+
+
+                            # Do same commands here, based on voice input...
+
+                            # Jump
+                            if ("jump" in command):
+                                m.runScriptSub(0) # run idle/reset sequence
+                                # while (m.getMovingState): time.sleep(0.5)
+                                
+                                print("Preparing to jump...")
+                                m.runScriptSub(5) # run crouching sequence
+                                # while (m.getMovingState): time.sleep(0.5)
+                                print("Ready to jump!")
+                                m.runScriptSub(6) # run jumping sequence
+                                # while (m.getMovingState): time.sleep(0.5)
+                                print("JUMP!!!")
+                            
+
+                            # Walk Forward
+                            elif ("walk" in command and "forward" in command):
+                                m.runScriptSub(0) # run idle/reset sequence
+                                # while (m.getMovingState): time.sleep(0.5)
+                                
+                                print("Walking... press Ctrl+C to stop walking.")
+                                try:
+                                    steps = 0
+                                    while (m.getMovingState):
+                                        steps += 1
+                                        print(f"Steps taken = {steps}")
+                                        m.runScriptSub(1) # run forwards walking sequence
+                                        time.sleep(0.5)
+                                
+                                except KeyboardInterrupt:
+                                    print('Done walking!')
+
+                            # Walk Backward
+                            elif ("walk" in command and "back" in command):
+                                m.runScriptSub(0) # run idle/reset sequence
+                                # while (m.getMovingState): time.sleep(0.5)
+                                
+                                print("Walking... press Ctrl+C to stop walking.")
+                                try:
+                                    steps = 0
+                                    while (m.getMovingState):
+                                        steps += 1
+                                        print(f"Steps taken = {steps}")
+                                        m.runScriptSub(2) # run backwards walking sequence
+                                        time.sleep(0.5)
+                                
+                                except KeyboardInterrupt:
+                                    print('Done walking!')
+
+                            # Turn right
+                            elif ("turn" in command and "right" in command):
+                                pass
+
+                            # Turn left
+                            elif ("turn" in command and "left" in command):
+                                pass
+
+                            # Invalid input
+                            else:
+                                print("Try again, I didn't recognize that command.")
+
+                            # Listen again
+                            stream_context = model.createStream()
+                            print("Listening...")
+
+                
+                except KeyboardInterrupt:
+                    print("Back to Mode = 0 [text commands]")
+                    mode = 0
+
+
+
+    finally:
+        m.stopScript() #stops the current Maestro sequence
+        m.close() #cleanly close USB serial port
+
+
+
+##########################################
 
 
 
 # Ensures the code underneath this if-statement only runs when run directly, rather than if it is imported
 if __name__ == "__main__":
-    # m = maestro.Controller('COM4') # for Aljon's PC, the value here should be the string 'COM4'
-    # r = voice control
+    # DeepSpeech stuff
+    DEFAULT_SAMPLE_RATE = 16000
+    import argparse
+    parser = argparse.ArgumentParser(description="Stream from microphone to DeepSpeech using VAD")
+    parser.add_argument('-v', '--vad_aggressiveness', type=int, default=3,
+                        help="Set aggressiveness of VAD: an integer between 0 and 3, 0 being the least aggressive about filtering out non-speech, 3 the most aggressive. Default: 3")
+    parser.add_argument('--nospinner', action='store_true',
+                        help="Disable spinner")
+    parser.add_argument('-w', '--savewav',
+                        help="Save .wav files of utterences to given directory")
+    parser.add_argument('-f', '--file',
+                        help="Read from .wav file instead of microphone")
 
-    # Mode text = 0 vs Mode text = 1
-    mode = 0
-
-    while True:
-        command = input("> ").split()
-
-
-        # Switch Mode
-        if (len(command) == 1 and command[0] == "walk" and command[1] == "forward"):
-            
-
-
-        # Walk Forward
-        elif (len(command) == 2 and command[0] == "walk" and command[1] == "forward"):
-            # m.runScriptSub(0) # run idle/reset sequence
-            # while (m.isMoving): continue
-            
-            # maestro sequences can be infinite when called
-
-            print("Walking... press Enter to walk another step, type 'stop' to stop walking.")
-            # m.runScriptSub(1) # run walking sequence
-            # while (m.isMoving): time.sleep(0.5)
-            x = input()
-
-
-        # Walk Backward
-        elif (len(command) == 2 and command[0] == "walk" and command[1] == "backward"):
-            # m.runScriptSub(0) # run idle/reset sequence
-            # while (m.isMoving): continue
-            
-            print("Walking... press Enter to walk another step, type 'stop' to stop walking.")
-            done = False
-            time_waiting = 0
-
-            while not done:
-                time_waiting += 1
-                print(f"Steps taken = {time_waiting}")
-                x = input()
-
-                # m.runScriptSub(1) # run walking sequence
-                # while (m.isMoving): time.sleep(0.5)
-
-                if x == "stop": 
-                    done = True
-
-
-        # Jump
-        elif (len(command) == 1 and command[0] == "jump"):
-            # m.runScriptSub(0) # run idle/reset sequence
-            # while (m.isMoving): time.sleep(0.5)
-            
-            print("Preparing to jump...")
-            # m.runScriptSub(6) # run crouching sequence
-            # while (m.isMoving): time.sleep(0.5)
-            print("Ready to jump!")
-            # m.runScriptSub(7) # run jumping sequence
-            # while (m.isMoving): time.sleep(0.5)
-            print("JUMP!!!")
-
-        
-        # Quit
-        elif (len(command) == 1 and command[0] == "quit"):
-            print("Shutting down Robot Dog...")
-            # m.runScriptSub(0) # run idle/reset sequence?
-            # m.stopScript() #stops the current Maestro sequence
-            break
-
-
-
-    # m.stopScript() #stops the current Maestro sequence
-    # m.close() #cleanly close USB serial port
+    parser.add_argument('-m', '--model', required=True,
+                        help="Path to the model (protocol buffer binary file, or entire directory containing all standard-named files for model)")
+    parser.add_argument('-s', '--scorer',
+                        help="Path to the external scorer file.")
+    parser.add_argument('-d', '--device', type=int, default=None,
+                        help="Device input index (Int) as listed by pyaudio.PyAudio.get_device_info_by_index(). If not provided, falls back to PyAudio.get_default_device().")
+    parser.add_argument('-r', '--rate', type=int, default=DEFAULT_SAMPLE_RATE,
+                        help=f"Input device sample rate. Default: {DEFAULT_SAMPLE_RATE}. Your device may require 44100.")
+    ARGS = parser.parse_args()
+    if ARGS.savewav: os.makedirs(ARGS.savewav, exist_ok=True)
+    main(ARGS)
